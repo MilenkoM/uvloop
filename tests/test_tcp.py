@@ -609,6 +609,41 @@ class _TestTCP:
 
 class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
+    def test_create_server_buffered_1(self):
+        SIZE = 123123
+
+        class Proto(asyncio.Protocol):
+            def connection_made(self, tr):
+                self.tr = tr
+                self.recvd = b''
+                self.data = bytearray(50)
+                self.buf = memoryview(self.data)
+
+            def get_buffer(self):
+                return self.buf
+
+            def buffer_updated(self, nbytes):
+                self.recvd += self.buf[:nbytes]
+                if self.recvd == b'a' * SIZE:
+                    self.tr.write(b'hello')
+
+        async def test():
+            port = tb.find_free_port()
+            srv = await self.loop.create_server(Proto, '127.0.0.1', port)
+
+            s = socket.socket(socket.AF_INET)
+            with s:
+                s.setblocking(False)
+                await self.loop.sock_connect(s, ('127.0.0.1', port))
+                await self.loop.sock_sendall(s, b'a' * SIZE)
+                d = await self.loop.sock_recv(s, 100)
+                self.assertEqual(d, b'hello')
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
+
     def test_transport_get_extra_info(self):
         # This tests is only for uvloop.  asyncio should pass it
         # too in Python 3.6.

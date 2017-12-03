@@ -223,7 +223,7 @@ cdef class UVBaseTransport(UVSocketHandle):
 
         self._waiter = waiter
 
-    cdef inline _set_protocol(self, object protocol):
+    cdef _set_protocol(self, object protocol):
         self._protocol = protocol
         # Store a reference to the bound method directly
         try:

@@ -215,6 +215,16 @@ cdef class UVStream(UVBaseTransport):
         self._buffer = []
         self._buffer_size = 0
 
+    cdef _set_protocol(self, object protocol):
+        UVBaseTransport._set_protocol(self, protocol)
+        try:
+            get_buffer = protocol.get_buffer
+            buffer_updated = protocol.buffer_updated
+        except AttributeError:
+            self.__buffered = 0
+        else:
+            self.__buffered = 1
+
     cdef inline _shutdown(self):
         cdef int err
 
@@ -263,9 +273,14 @@ cdef class UVStream(UVBaseTransport):
         if self.__reading:
             return
 
-        err = uv.uv_read_start(<uv.uv_stream_t*>self._handle,
-                               __loop_alloc_buffer,
-                               __uv_stream_on_read)
+        if self.__buffered:
+            err = uv.uv_read_start(<uv.uv_stream_t*>self._handle,
+                                   __uv_stream_buffered_alloc,
+                                   __uv_stream_buffered_on_read)
+        else:
+            err = uv.uv_read_start(<uv.uv_stream_t*>self._handle,
+                                   __loop_alloc_buffer,
+                                   __uv_stream_on_read)
         if err < 0:
             exc = convert_error(err)
             self._fatal_error(exc, True)
@@ -711,22 +726,13 @@ cdef void __uv_stream_on_shutdown(uv.uv_shutdown_t* req,
         return
 
 
-cdef inline void __uv_stream_on_read_impl(uv.uv_stream_t* stream,
-                                          ssize_t nread,
-                                          const uv.uv_buf_t* buf):
-    cdef:
-        UVStream sc = <UVStream>stream.data
-        Loop loop = sc._loop
-
-    # It's OK to free the buffer early, since nothing will
-    # be able to touch it until this method is done.
-    __loop_free_buffer(loop)
-
+cdef inline bint __uv_stream_on_read_common(UVStream sc, Loop loop,
+                                            ssize_t nread):
     if sc._closed:
         # The stream was closed, there is no reason to
         # do any work now.
         sc.__reading_stopped()  # Just in case.
-        return
+        return True
 
     if nread == uv.UV_EOF:
         # From libuv docs:
@@ -745,13 +751,13 @@ cdef inline void __uv_stream_on_read_impl(uv.uv_stream_t* stream,
 
             sc._error(ex, False)
         finally:
-            return
+            return True
 
     if nread == 0:
         # From libuv docs:
         #     nread might be 0, which does not indicate an error or EOF.
         #     This is equivalent to EAGAIN or EWOULDBLOCK under read(2).
-        return
+        return True
 
     if nread < 0:
         # From libuv docs:
@@ -770,11 +776,28 @@ cdef inline void __uv_stream_on_read_impl(uv.uv_stream_t* stream,
             # Used for getting notified when a pipe is closed.
             # See WriteUnixTransport for the explanation.
             sc._on_eof()
-            return
+            return True
 
         exc = convert_error(nread)
         sc._fatal_error(exc, False,
             "error status in uv_stream_t.read callback")
+        return True
+
+    return False
+
+
+cdef inline void __uv_stream_on_read_impl(uv.uv_stream_t* stream,
+                                          ssize_t nread,
+                                          const uv.uv_buf_t* buf):
+    cdef:
+        UVStream sc = <UVStream>stream.data
+        Loop loop = sc._loop
+
+    # It's OK to free the buffer early, since nothing will
+    # be able to touch it until this method is done.
+    __loop_free_buffer(loop)
+
+    if __uv_stream_on_read_common(sc, loop, nread):
         return
 
     try:
@@ -828,9 +851,6 @@ cdef void __uv_stream_on_read(uv.uv_stream_t* stream,
                             "UVStream read callback") == 0:
         return
 
-    cdef:
-        Loop loop = <Loop>stream.loop.data
-
     # Don't need try-finally, __uv_stream_on_read_impl is void
     __uv_stream_on_read_impl(stream, nread, buf)
 
@@ -844,8 +864,58 @@ cdef void __uv_stream_on_write(uv.uv_write_t* req, int status) with gil:
                 status)
             return
 
-    cdef:
-        Loop loop = <UVStream>(<_StreamWriteContext> req.data).stream._loop
-
     # Don't need try-finally, __uv_stream_on_write_impl is void
     __uv_stream_on_write_impl(req, status)
+
+
+cdef void __uv_stream_buffered_alloc(uv.uv_handle_t* stream,
+                                     size_t suggested_size,
+                                     uv.uv_buf_t* uvbuf) with gil:
+
+    if __ensure_handle_data(<uv.uv_handle_t*>stream,
+                            "UVStream alloc buffer callback") == 0:
+        return
+
+    cdef:
+        UVStream sc = <UVStream>stream.data
+        Py_buffer* pybuf = &sc._read_pybuf
+
+    try:
+        buf = sc._protocol.get_buffer()
+        PyObject_GetBuffer(buf, pybuf, PyBUF_WRITABLE)
+    except BaseException as exc:
+        sc._fatal_error(exc, False)
+        return
+
+    uvbuf.base = <char*>pybuf.buf
+    uvbuf.len = pybuf.len
+
+
+cdef void __uv_stream_buffered_on_read(uv.uv_stream_t* stream,
+                                       ssize_t nread,
+                                       const uv.uv_buf_t* buf) with gil:
+
+    if __ensure_handle_data(<uv.uv_handle_t*>stream,
+                            "UVStream buffered read callback") == 0:
+        return
+
+    cdef:
+        UVStream sc = <UVStream>stream.data
+        Loop loop = sc._loop
+        Py_buffer* pybuf = &sc._read_pybuf
+
+    try:
+        if __uv_stream_on_read_common(sc, loop, nread):
+            return
+
+        if UVLOOP_DEBUG:
+            loop._debug_stream_read_cb_total += 1
+
+        sc._protocol.buffer_updated(nread)
+    except BaseException as exc:
+        if UVLOOP_DEBUG:
+            loop._debug_stream_read_cb_errors_total += 1
+
+        sc._error(exc, False)
+    finally:
+        PyBuffer_Release(pybuf)

@@ -4,9 +4,12 @@ cdef class UVStream(UVBaseTransport):
         bint __shutting_down
         bint __reading
         bint __read_error_close
+        bint __buffered
         bint _eof
         list _buffer
         size_t _buffer_size
+
+        Py_buffer _read_pybuf
 
     # All "inline" methods are final
 
