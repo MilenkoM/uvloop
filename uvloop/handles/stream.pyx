@@ -218,8 +218,8 @@ cdef class UVStream(UVBaseTransport):
     cdef _set_protocol(self, object protocol):
         UVBaseTransport._set_protocol(self, protocol)
         try:
-            get_buffer = protocol.get_buffer
-            buffer_updated = protocol.buffer_updated
+            self._protocol_get_buffer = protocol.get_buffer
+            self._protocol_buffer_updated = protocol.buffer_updated
         except AttributeError:
             self.__buffered = 0
         else:
@@ -881,7 +881,7 @@ cdef void __uv_stream_buffered_alloc(uv.uv_handle_t* stream,
         Py_buffer* pybuf = &sc._read_pybuf
 
     try:
-        buf = sc._protocol.get_buffer()
+        buf = sc._protocol_get_buffer()
         PyObject_GetBuffer(buf, pybuf, PyBUF_WRITABLE)
     except BaseException as exc:
         sc._fatal_error(exc, False)
@@ -904,6 +904,12 @@ cdef void __uv_stream_buffered_on_read(uv.uv_stream_t* stream,
         Loop loop = sc._loop
         Py_buffer* pybuf = &sc._read_pybuf
 
+    if nread == 0:
+        # From libuv docs:
+        #     nread might be 0, which does not indicate an error or EOF.
+        #     This is equivalent to EAGAIN or EWOULDBLOCK under read(2).
+        return
+
     try:
         if __uv_stream_on_read_common(sc, loop, nread):
             return
@@ -911,7 +917,7 @@ cdef void __uv_stream_buffered_on_read(uv.uv_stream_t* stream,
         if UVLOOP_DEBUG:
             loop._debug_stream_read_cb_total += 1
 
-        sc._protocol.buffer_updated(nread)
+        sc._protocol_buffer_updated(nread)
     except BaseException as exc:
         if UVLOOP_DEBUG:
             loop._debug_stream_read_cb_errors_total += 1
